@@ -4,12 +4,22 @@
 #include <time.h>
 #include <signal.h>
 
+//#define USE_MQTT
+#ifndef bool
+typedef unsigned char bool;
+#define true  1
+#define false 0
+#endif
 #include <imgproc.h>
+#ifdef USE_MQTT
 #include <mosquitto.h>
+#endif
 
 #define NUM_REGIONS      8
 #define IMAGE_WIDTH    176
-#define IMAGE_HEIGHT   144 
+#define IMAGE_HEIGHT   144
+#define RGN_WIDTH       10
+#define RGN_HEIGHT      10
 #define WATER_METER_TOTAL_FILE   "/home/pi/logs/water-meter-total"
 
 typedef struct _REGION {
@@ -17,21 +27,34 @@ typedef struct _REGION {
    unsigned int w, h;
 } REGION;
 
-REGION region[] =
+#define ORG_X 67
+#define ORG_Y 45
+#define ORG_R 30
+#define DX    21 // (unsigned int)(ORG_R*0.71)
+#define DY    21 // (unsigned int)(ORG_R*0.71)
+
+//unsigned int xDiv[5] = { 40, 45, 67, 90, 95 };
+//unsigned int yDiv[5] = { 15, 25, 45, 65, 75 };
+const unsigned int xDiv[5] = { ORG_X-ORG_R, ORG_X-DX, ORG_X, ORG_X+DX, ORG_X+ORG_R };
+const unsigned int yDiv[5] = { ORG_Y-ORG_R, ORG_Y-DY, ORG_Y, ORG_Y+DY, ORG_Y+ORG_R };
+
+REGION region[NUM_REGIONS] =
 {
-   {45, 65, 10, 10},
-   {40, 45, 10, 10},
-   {45, 25, 10, 10},
-   {67, 15, 10, 10},
-   {90, 25, 10, 10},
-   {95, 45, 10, 10},
-   {90, 65, 10, 10},
-   {67, 75, 10, 10}
+   {ORG_X-DX,     ORG_Y+DY,     RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X-ORG_R,  ORG_Y,        RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X-DX,     ORG_Y-DY,     RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X,        ORG_Y-ORG_R,  RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X+DX,     ORG_Y-DY,     RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X+ORG_R,  ORG_Y,        RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X+DX,     ORG_Y+DY,     RGN_WIDTH, RGN_HEIGHT},
+   {ORG_X,        ORG_Y+ORG_R,  RGN_WIDTH, RGN_HEIGHT}
 };
 
 Viewer *view = NULL;
 Camera *cam  = NULL;
+#ifdef USE_MQTT
 struct mosquitto *mosq = NULL;
+#endif
 double meter_start_value = 0.0;
 
 static int regionHit(Image *img) {
@@ -70,7 +93,7 @@ static int regionHit(Image *img) {
          }
       }
 
-      // We have a hit if more than 80% of the pixels is dark 
+      // We have a hit if more than 80% of the pixels is dark
       if (count_dark > (rw * rh) * 0.8){
          return i;
       }
@@ -99,7 +122,7 @@ static void drawRegion(Image *img, REGION region, unsigned char red, unsigned ch
    for (y = ry; y < ry + rh; y++) imgSetPixel(img, x, y, blue, green, red);
 }
 void doPublish(char *topic, char *payload) {
-
+#ifdef USE_MQTT
    int i;
    int  rc;
 
@@ -119,10 +142,12 @@ void doPublish(char *topic, char *payload) {
          return;
       }
    }
+#endif
 }
 
 void publishValues(time_t time, double last_minute, double last_10minute, double last_drain,
                    double total) {
+#ifdef USE_MQTT
    char *last_minute_topic   = "/lusa/misc-1/WATER_METER_FLOW/status";
    char *last_10minute_topic = "/lusa/misc-1/WATER_METER_10MIN/status";
    char *last_drain_topic    = "/lusa/misc-1/WATER_METER_DRAIN/status";
@@ -167,7 +192,9 @@ void publishValues(time_t time, double last_minute, double last_10minute, double
 
       mosquitto_loop(mosq, 0, 1);
    }
-   else {
+   else
+#endif
+   {
       fprintf(stderr, "Error: mosq\n");
       fflush(stderr);
    }
@@ -201,7 +228,7 @@ void updateValues(int new_region_number) {
       fflush(stdout);
 
       elapsed_regions = new_region_number - last_region_number;
-      if (elapsed_regions < 0) elapsed_regions += NUM_REGIONS;  
+      if (elapsed_regions < 0) elapsed_regions += NUM_REGIONS;
 
       total         += (elapsed_regions * 1.0 / NUM_REGIONS);
       last_minute   += (elapsed_regions * 1.0 / NUM_REGIONS);
@@ -210,14 +237,14 @@ void updateValues(int new_region_number) {
 
    }
    if (new_time >= last_update_time + 60) {
-      
+
       publishValues(new_time, last_minute, last_10minute, last_drain, total);
 
 
       fprintf(stdout, "%s - Last minute: %6.2f l, Last 10min: %6.2f l, Last drain: %6.2f l, Total: %8.2f l, Framerate: %d\n",
               time_str, last_minute, last_10minute, last_drain, total + meter_start_value, frame_rate/60);
       fflush(stdout);
-   
+
       if (last_minute == 0.0) last_drain = 0.0;
       last_minute = 0.0;
       last_update_time = new_time;
@@ -239,9 +266,11 @@ static void cleanup(int sig, siginfo_t *siginfo, void *context) {
    // unintialise the library
    quit_imgproc();
 
+#ifdef USE_MQTT
    // cleanup mosquitto connection
    if (mosq) mosquitto_destroy(mosq);
    mosquitto_lib_cleanup();
+#endif
 
    exit(0);
 }
@@ -249,10 +278,12 @@ static void cleanup(int sig, siginfo_t *siginfo, void *context) {
 int main(int argc, char * argv[])
 {
    int    i;
-   char   *host = "192.168.0.23";
+#ifdef USE_MQTT
+   char   *host = "192.168.1.72";
    int    port = 1883;
    int    keepalive = 120;
    bool   clean_session = true;
+#endif
    int    new_region_number;
    bool   display_image = false;
 
@@ -269,10 +300,10 @@ int main(int argc, char * argv[])
 
    // get start options
    for (i = 0; i < argc; i++) {
-      if (strcmp(argv[i], "-di") == 0) { 
+      if (strcmp(argv[i], "-di") == 0) {
          display_image = true;
       }
-      if (strcmp(argv[i], "-start_value") == 0) { 
+      if (strcmp(argv[i], "-start_value") == 0) {
          i++;
          sscanf(argv[i], "%lf", &meter_start_value);
       }
@@ -286,8 +317,8 @@ int main(int argc, char * argv[])
       }
    }
 
-   
 
+#ifdef USE_MQTT
    // initialise mosquitto connection
    mosquitto_lib_init();
    mosq = mosquitto_new(NULL, clean_session, NULL);
@@ -302,11 +333,12 @@ int main(int argc, char * argv[])
       fflush(stderr);
       return 1;
    }
+#endif
 
    // initialise the image library
    init_imgproc();
 
-   // open the webcam 
+   // open the webcam
    cam = camOpen(IMAGE_WIDTH, IMAGE_HEIGHT);
    if (!cam) {
       fprintf(stderr, "Unable to open camera\n");
@@ -324,7 +356,7 @@ int main(int argc, char * argv[])
       }
    }
 
-   // capture images from the webcam	
+   // capture images from the webcam
    while(1){
       Image *img = camGrabImage(cam);
       if (!img) {
@@ -341,7 +373,7 @@ int main(int argc, char * argv[])
 
       if (display_image) {
          for (i = 0; i < NUM_REGIONS; i++) {
-          
+
             unsigned char red = 0;
             unsigned char green= 255;
             unsigned char blue = 0;
