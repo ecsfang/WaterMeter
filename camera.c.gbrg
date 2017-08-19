@@ -1,0 +1,481 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <assert.h>
+
+#include <getopt.h>             /* getopt_long() */
+
+#include <fcntl.h>             /* low-level i/o */
+#include <unistd.h>
+#include <errno.h>
+#include <malloc.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+
+#include <asm/types.h>          /* for videodev2.h */
+#include <linux/videodev2.h>
+
+#include "imgproc.h"
+
+
+struct Buffer {
+	struct v4l2_buffer buf;
+	void * start;
+};
+
+
+static void errno_exit(const char *s)
+{
+        fprintf (stderr, "%s error %d, %s\n",
+			s, errno, strerror (errno));
+
+        exit (EXIT_FAILURE);
+}
+
+
+static int xioctl(Camera * cam, int request, void *arg)
+{
+        int r;
+
+        do r = ioctl (cam->handle, request, arg);
+        while (-1 == r && EINTR == errno);
+
+        return r;
+}
+
+
+// routine to initialise memory mapped i/o on the camera device
+static void init_mmap(Camera * cam)
+{
+	struct v4l2_requestbuffers req;
+
+	memset (&(req), 0, sizeof (req));
+
+	req.count               = 4;
+	req.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory              = V4L2_MEMORY_MMAP;
+
+	if (-1 == xioctl (cam, VIDIOC_REQBUFS, &req)) {
+		if (EINVAL == errno) {
+			fprintf (stderr, "%s does not support "
+					"memory mapping\n", cam->name);
+			exit (EXIT_FAILURE);
+		} else {
+			errno_exit ("VIDIOC_REQBUFS");
+		}
+	}
+
+	if (req.count < 2) {
+		fprintf (stderr, "Insufficient buffer memory on %s\n",
+				 cam->name);
+		exit (EXIT_FAILURE);
+	}
+
+	// allocate memory for the buffers
+	cam->buffers = calloc (req.count, sizeof (*(cam->buffers)));
+
+	if (!cam->buffers) {
+		fprintf (stderr, "Out of memory\n");
+		exit (EXIT_FAILURE);
+	}
+
+	for (cam->n_buffers = 0; cam->n_buffers < req.count; cam->n_buffers++) {
+		struct v4l2_buffer buffer;
+
+		memset (&(buffer), 0, sizeof (buffer));
+
+		buffer.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buffer.memory      = V4L2_MEMORY_MMAP;
+		buffer.index       = cam->n_buffers;
+
+		if (-1 == xioctl (cam, VIDIOC_QUERYBUF, &buffer)){
+			errno_exit ("VIDIOC_QUERYBUF");
+		}
+
+		// copy the v4l2 buffer into the device buffers
+		cam->buffers[cam->n_buffers].buf = buffer;
+		// memory map the device buffers
+		cam->buffers[cam->n_buffers].start = 
+			mmap( NULL, // start anywhere
+				  buffer.length,
+				  PROT_READ | PROT_WRITE, // required
+				  MAP_SHARED, // recommended
+				  cam->handle,
+				  buffer.m.offset
+			);
+
+		if (MAP_FAILED == cam->buffers[cam->n_buffers].start){
+			errno_exit ("mmap");
+		}
+	}
+}
+
+
+// returns an index to the dequeued buffer
+static unsigned int camDequeueBuffer(Camera * cam)
+{
+	while(1){
+		fd_set fds;
+		struct timeval tv;
+		int r;
+
+		
+		FD_ZERO (&fds);
+		FD_SET (cam->handle, &fds);
+
+		// Timeout.
+		tv.tv_sec = 20;
+		tv.tv_usec = 0;
+
+		
+		r = select (cam->handle + 1, &fds, NULL, NULL, &tv);
+
+		if (-1 == r) {
+			if (EINTR == errno){
+				continue;
+			}
+			errno_exit ("select");
+		}
+
+		if (0 == r) {
+			fprintf (stderr, "select timeout\n");
+                //        continue;            //GOL
+			exit (EXIT_FAILURE);
+		}
+
+		
+		// read the frame
+		struct v4l2_buffer buffer;
+		memset (&(buffer), 0, sizeof (buffer));
+
+		buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buffer.memory = V4L2_MEMORY_MMAP;
+		
+		// dequeue a buffer
+		if (-1 == xioctl (cam, VIDIOC_DQBUF, &buffer)) {
+			switch (errno) {
+				case EAGAIN:
+					continue;
+
+				case EIO:
+					/* Could ignore EIO, see spec. */
+					/* fall through */
+
+				default:
+					errno_exit ("VIDIOC_DQBUF");
+			}
+		}
+		assert (buffer.index < cam->n_buffers);
+
+		// return the buffer index handle to the buffer
+		return buffer.index;
+	}
+}
+
+
+// enqueue a given device buffer to the device
+static void camEnqueueBuffer(Camera * cam, unsigned int buffer_id)
+{
+	// enqueue a given buffer by index
+	if(-1 == xioctl(cam, VIDIOC_QBUF, &(cam->buffers[buffer_id].buf) )){
+		errno_exit("VIDIOC_QBUF");
+	}
+
+	return;
+}
+	
+// Convert from GRBG to RGB format. Code taken from fsweb project. GOL/Lundix IT
+#define SRC_PAL_BAYER 0x1
+#define SRC_PAL_SGRBG8 0x2
+int gbrg_to_rgb(uint8_t *dst, uint8_t *img, uint32_t length, uint32_t w, uint32_t h, int palette)
+{
+        uint32_t x = 0, y = 0;
+        uint32_t i = w * h;
+
+        if(length < i) return(-1);
+
+        /* SGBRG8 bayer pattern:
+         *
+         * GBGBGBGBGB
+         * RGRGRGRGRG
+         * GBGBGBGBGB
+         * RGRGRGRGRG
+         *
+        */
+
+        while(i-- > 0)
+        {
+                uint8_t *p[8];
+                uint8_t hn, vn, di;
+                uint8_t r, g, b;
+                int mode;
+
+                /* Setup pointers to this pixel's neighbours. */
+                p[0] = img - w - 1;
+                p[1] = img - w;
+                p[2] = img - w + 1;
+                p[3] = img - 1;
+                p[4] = img + 1;
+                p[5] = img + w - 1;
+                p[6] = img + w;
+                p[7] = img + w + 1;
+
+                /* Juggle pointers if they are out of bounds. */
+                if(!y)              { p[0]=p[5]; p[1]=p[6]; p[2]=p[7]; }
+                else if(y == h - 1) { p[5]=p[0]; p[6]=p[1]; p[7]=p[2]; }
+                if(!x)              { p[0]=p[2]; p[3]=p[4]; p[5]=p[7]; }
+                else if(x == w - 1) { p[2]=p[0]; p[4]=p[3]; p[7]=p[5]; }
+
+                /* Average matching neighbours. */
+                hn = (*p[3] + *p[4]) / 2;
+                vn = (*p[1] + *p[6]) / 2;
+                di = (*p[0] + *p[2] + *p[5] + *p[7]) / 4;
+
+                /* Calculate RGB */
+                if(palette == SRC_PAL_BAYER) mode = (x + y) & 0x01;
+                else mode = ~(x + y) & 0x01;
+
+                if(mode)
+                {
+                        g = *img;
+                        if(y & 0x01) { r = hn; b = vn; }
+                        else         { r = vn; b = hn; }
+                }
+                else if(y & 0x01) { r = *img; g = (vn + hn) / 2; b = di; }
+                else              { b = *img; g = (vn + hn) / 2; r = di; }
+
+                if(palette == SRC_PAL_SGRBG8)
+                {
+                        uint8_t t = r;
+                        r = b;
+                        b = t;
+                }
+
+                *(dst++) = r;
+                *(dst++) = g;
+                *(dst++) = b;
+
+                /* Move to the next pixel (or line) */
+                if(++x == w) { x = 0; y++; }
+                img++;
+        }
+
+        return(0);
+}
+
+// Grab Image
+Image * camGrabImage(Camera * cam)
+{
+	// Create a new image
+	Image * img = imgNew(cam->width, cam->height);
+
+	// dequeue a buffer
+	unsigned int buffer_id = camDequeueBuffer(cam);
+
+	// Copy data across, converting to RGB along the way
+	uint8_t *buffer_ptr = (uint8_t *)cam->buffers[buffer_id].start;
+	uint8_t *img_ptr = (uint8_t *)img->data;
+
+        // Convert from GRBG to RGB. GOL/Lundix IT
+        gbrg_to_rgb(img_ptr, buffer_ptr, cam->buffers[buffer_id].buf.length, 
+                          cam->width,  cam->height, SRC_PAL_SGRBG8);
+
+	// requeue the buffer
+	camEnqueueBuffer(cam, buffer_id);
+
+	// return the image
+	return img;
+}
+
+
+static void camSetFormat(Camera * cam, unsigned int width, unsigned int height)
+{
+	//printf("Setting device format\n");
+
+	struct v4l2_format fmt;
+	unsigned int min;
+
+	memset (&(fmt), 0, sizeof (fmt));
+	
+	fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width       = width; 
+	fmt.fmt.pix.height      = height;
+//	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SGBRG8;
+	fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+//	fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+
+	if (-1 == xioctl (cam, VIDIOC_S_FMT, &fmt)){
+		errno_exit ("VIDIOC_S_FMT");
+	}
+
+    // Note VIDIOC_S_FMT may change width and height.
+	
+	// Buggy driver paranoia.
+	min = fmt.fmt.pix.width * 2;
+	if (fmt.fmt.pix.bytesperline < min)
+		fmt.fmt.pix.bytesperline = min;
+	min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
+	if (fmt.fmt.pix.sizeimage < min)
+		fmt.fmt.pix.sizeimage = min;
+
+	// ONLY CHANGES IN IMAGE SIZE ARE HANDLED ATM
+	// set device image size to the returned width and height.
+	cam->width = fmt.fmt.pix.width;
+	cam->height = fmt.fmt.pix.height;
+	
+	//printf("Initialising memory mapped i/o\n");
+	
+	// initialise for memory mapped io
+	init_mmap (cam);
+	
+	
+	// initialise streaming for capture
+	enum v4l2_buf_type type;
+	
+	// queue buffers ready for capture
+	unsigned int i;
+	for (i = 0; i < cam->n_buffers; ++i) {
+		// buffers are initialised, so just call the enqueue function
+		camEnqueueBuffer(cam, i);		
+	}
+	
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+	// turn on streaming
+	if (-1 == xioctl (cam, VIDIOC_STREAMON, &type)){
+		if(errno == EINVAL){
+			fprintf(stderr, "buffer type not supported, or no buffers allocated or mapped\n");
+			exit(EXIT_FAILURE);
+		} else if(errno == EPIPE){
+			fprintf(stderr, "The driver implements pad-level format configuration and the pipeline configuration is invalid.\n");
+			exit(EXIT_FAILURE);
+		} else {
+			errno_exit ("VIDIOC_STREAMON");
+		}
+	}
+}
+
+
+// close video capture device
+void camClose(Camera * cam)
+{
+	//printf("Stopping camera capture\n");
+
+	// stop capturing
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (-1 == xioctl (cam, VIDIOC_STREAMOFF, &type)){
+		errno_exit ("VIDIOC_STREAMOFF");
+	}
+
+
+	//printf("Uninitialising device\n");
+
+	// uninitialise the device
+        unsigned int i;
+	for (i = 0; i < cam->n_buffers; ++i){
+		if(-1 == munmap(cam->buffers[i].start, cam->buffers[i].buf.length)){
+			errno_exit("munmap");
+		}
+	}
+	
+	// free buffers
+	free (cam->buffers);
+	
+	//printf("Closing device\n");
+
+	// close the device
+	if (-1 == close(cam->handle)){
+		errno_exit ("close");
+	}
+
+	free(cam);
+	cam->handle = -1;
+}
+
+
+// Open a video capture device
+Camera * camOpen(unsigned int width, unsigned int height)
+{
+	//printf("Opening the device\n");
+	
+
+	char * dev_name = "/dev/video0";
+
+	
+	// initialise the device
+	struct stat st; 
+
+	if (-1 == stat (dev_name, &st)) {
+		fprintf (stderr, "Cannot identify '%s': %d, %s\n",
+			dev_name, errno, strerror (errno));
+		exit (EXIT_FAILURE);
+	}
+
+	if (!S_ISCHR (st.st_mode)) {
+		fprintf (stderr, "%s is no device\n", dev_name);
+		exit (EXIT_FAILURE);
+	}
+
+	
+	// set up the device
+	Camera * cam = malloc(sizeof(*cam));
+	if(cam == NULL){
+		fprintf(stderr, "Could not allocate memory for device structure\n");
+		exit(EXIT_FAILURE);
+	}
+	
+	// open the device
+	cam->handle = open(dev_name, O_RDWR | O_NONBLOCK, 0);
+	cam->name = dev_name;
+
+	if (-1 == cam->handle) {
+		fprintf (stderr, "Cannot open '%s': %d, %s\n",
+			 dev_name, errno, strerror (errno));
+		exit (EXIT_FAILURE);
+	}
+	
+	
+	//printf("Initialising device\n");
+	
+	
+	// initialise the device
+	struct v4l2_capability cap;
+
+	// check capabilities
+	if (-1 == xioctl (cam, VIDIOC_QUERYCAP, &cap)) {
+		if (EINVAL == errno) {
+			fprintf (stderr, "%s is no V4L2 device\n",
+					 cam->name);
+			exit (EXIT_FAILURE);
+		} else {
+				errno_exit ("VIDIOC_QUERYCAP");
+		}
+	}
+
+	// check capture capable
+	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+		fprintf (stderr, "%s is no video capture device\n",
+					 cam->name);
+		exit (EXIT_FAILURE);
+	}
+
+
+	// check for memory mapped io
+	if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+		fprintf (stderr, "%s does not support streaming i/o\n",
+			 cam->name);
+		exit (EXIT_FAILURE);
+	}
+	
+	
+	// Set the Camera's format
+	camSetFormat(cam, width, height);
+
+
+	return cam;
+}
